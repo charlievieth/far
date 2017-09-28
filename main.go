@@ -2,15 +2,15 @@ package main
 
 import (
 	"archive/tar"
-	"bytes"
+	"bufio"
 	"compress/gzip"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
-	"runtime"
 	"time"
 
 	"github.com/charlievieth/zero"
@@ -20,36 +20,93 @@ const (
 	kB = 1 << (10 * (iota + 1))
 	mB
 	gB
+
+	BufSize = 32 * mB
 )
 
-const BufSize = 32 * 1024
+var Debugf = func(format string, a ...interface{}) {}
 
-type Copier struct {
-	r   io.Reader
-	w   *os.File
-	off int64
-	buf []byte
-}
-
-func NewCopier(r io.Reader, w *os.File) *Copier {
-	return &Copier{
-		r:   r,
-		w:   w,
-		buf: make([]byte, BufSize),
+func init() {
+	const usageMsg = "Usage %s: ARCHIVE [-C DIR]\n"
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, usageMsg, filepath.Base(os.Args[0]))
+		flag.PrintDefaults()
 	}
 }
 
-func (c *Copier) Copy() (written int64, err error) {
+func parseFlags() (archive, dirname string, _ error) {
+	var workingDirectory string
+	var enableDebug bool
+
+	flag.StringVar(&workingDirectory, "directory", "", "change to directory DIR")
+	flag.StringVar(&workingDirectory, "C", "", "change to directory DIR")
+	flag.BoolVar(&enableDebug, "debug", false, "print debugging information")
+
+	flag.Parse()
+
+	if enableDebug {
+		Debugf = log.New(os.Stderr, "debug: ", 0).Printf
+		Debugf("DEBUG output enabled")
+	}
+
+	Debugf("validating command line arguments")
+
+	switch flag.NArg() {
+	case 0:
+		return "", "", errors.New("missing ARCHIVE argument")
+	case 1:
+		archive = flag.Arg(0)
+		fi, err := os.Stat(archive)
+		if err != nil {
+			return "", "", fmt.Errorf("invalid ARCHIVE argument (%s): %s", archive, err)
+		}
+		if fi.IsDir() {
+			return "", "", fmt.Errorf("invalid ARCHIVE argument (%s): invalid file type",
+				archive)
+		}
+	default:
+		return "", "", fmt.Errorf("too many arguments: %s", flag.Args())
+	}
+
+	if workingDirectory != "" {
+		Debugf("validating [C|directory] argument: %s", workingDirectory)
+		fi, err := os.Stat(workingDirectory)
+		if err != nil {
+			return "", "", fmt.Errorf("invalid argument [C|directory] (%s): %s",
+				workingDirectory, err)
+		}
+		if !fi.IsDir() {
+			return "", "", fmt.Errorf("invalid argument [C|directory] (%s): not a diretory",
+				workingDirectory)
+		}
+		dirname = workingDirectory
+	} else {
+		pwd, err := os.Getwd()
+		if err != nil {
+			return "", "", err
+		}
+		Debugf("no [C|directory] argment provided using: %s", pwd)
+		dirname = pwd
+	}
+
+	Debugf("Argument [ARCHIVE]: %s", archive)
+	Debugf("Argument [C|dirname]: %s", dirname)
+
+	return archive, dirname, nil
+}
+
+func Copy(dst *os.File, src io.Reader, buf []byte) (written int64, err error) {
+	var off int64
 	for {
-		nr, er := c.r.Read(c.buf)
+		nr, er := src.Read(buf)
 		if nr > 0 {
 			nw := BufSize
 			var ew error
-			if !zero.Zero(c.buf[:nr]) {
-				nw, ew = c.w.WriteAt(c.buf[:nr], c.off)
+			if !zero.Zero(buf[:nr]) {
+				nw, ew = dst.WriteAt(buf[:nr], off)
 			}
 			written += int64(nw)
-			c.off += int64(nw)
+			off += int64(nw)
 			if ew != nil {
 				err = ew
 				break
@@ -85,7 +142,7 @@ func ExtractFile(tr *tar.Reader, h *tar.Header, dirname string) error {
 	}
 
 	path := filepath.Join(dirname, name)
-	fmt.Fprintf(os.Stderr, "Extracting: %s to %s\n", name, path)
+	Debugf("Extracting: %s to %s\n", name, path)
 
 	f, err := MakeFile(path, h.Size+(h.Size/50)) // over allocate by %2
 	if err != nil {
@@ -99,12 +156,7 @@ func ExtractFile(tr *tar.Reader, h *tar.Header, dirname string) error {
 		return err
 	}
 
-	w := Copier{
-		r:   tr,
-		w:   f,
-		buf: make([]byte, BufSize),
-	}
-	n, err := w.Copy()
+	n, err := Copy(f, tr, make([]byte, BufSize))
 	if err != nil {
 		return handleErr(err)
 	}
@@ -119,91 +171,59 @@ func ExtractFile(tr *tar.Reader, h *tar.Header, dirname string) error {
 
 	d := time.Since(t)
 	mbs := float64(d/mB) / d.Seconds()
-	fmt.Fprintf(os.Stderr, "Extracted (%s) in: %s - %.2fMB/s\n",
-		name, time.Since(t), mbs)
+	Debugf("Extracted (%s) in: %s - %.2fMB/s\n", name, time.Since(t), mbs)
 
 	return nil
 }
 
-var WorkingDirectory string
-
-func init() {
-	flag.StringVar(&WorkingDirectory, "directory", "", "Working directory")
-	flag.StringVar(&WorkingDirectory, "C", "", "Working directory")
-}
-
-func main() {
-	flag.Parse()
-	if len(flag.Args()) != 1 {
-		Fatal("USAGE [OPTIONS] ARCHIVE")
-	}
-	tarfile := flag.Arg(0)
-
-	// read file into memory so we don't compete for IO
-	t := time.Now()
-	fmt.Fprintln(os.Stderr, "reading tar archive:", tarfile)
-	b, err := ioutil.ReadFile(tarfile)
+func realMain() error {
+	tarfile, dirname, err := parseFlags()
 	if err != nil {
-		Fatal(err)
+		flag.Usage()
+		return errors.New("invalid command line arguments")
 	}
-	fmt.Fprintln(os.Stderr, "done reading tar archive:", time.Since(t))
 
-	gr, err := gzip.NewReader(bytes.NewReader(b))
+	fa, err := os.Open(tarfile)
 	if err != nil {
-		Fatal(err)
+		return err
+	}
+	defer fa.Close()
+
+	// Read file in chunks to improve IO
+	gr, err := gzip.NewReader(bufio.NewReaderSize(fa, BufSize))
+	if err != nil {
+		return err
 	}
 	defer gr.Close()
 
-	dirname, err := os.Getwd()
-	if err != nil {
-		Fatal(err)
-	}
-	if WorkingDirectory != "" {
-		dirname, err = filepath.Abs(WorkingDirectory)
-		if err != nil {
-			Fatal(err)
-		}
-	}
-	fmt.Fprintln(os.Stderr, "working directory:", dirname)
-
 	// normally I'd error, but let's just make the thing
 	if err := os.MkdirAll(dirname, 0744); err != nil {
-		Fatal(err)
+		return err
 	}
 
-	t = time.Now()
-	fmt.Fprintln(os.Stderr, "starting extraction...")
+	t := time.Now()
+	Debugf("starting extraction...")
 	tr := tar.NewReader(gr)
 	for {
 		h, e := tr.Next()
 		if h != nil {
 			if err := ExtractFile(tr, h, dirname); err != nil {
-				Fatal(err)
+				return err
 			}
 		}
 		if e != nil {
 			break
 		}
 	}
-	fmt.Fprintln(os.Stderr, "extraction complete:", time.Since(t))
-	fmt.Fprintln(os.Stderr, "ain't that fast as shit - we're done here")
+
+	Debugf("extraction complete:", time.Since(t))
+	return nil
 }
 
-func Fatal(err interface{}) {
-	if err == nil {
-		return
+func main() {
+	if err := realMain(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %s", err)
+		fmt.Fprintln(os.Stderr, "Error is not recoverable: exiting now")
+		os.Exit(1)
 	}
-	var format string
-	if _, file, line, ok := runtime.Caller(1); ok && file != "" {
-		format = fmt.Sprintf("Error (%s:%d)", filepath.Base(file), line)
-	} else {
-		format = "Error"
-	}
-	switch err.(type) {
-	case error, string:
-		fmt.Fprintf(os.Stderr, "%s: %s\n", format, err)
-	default:
-		fmt.Fprintf(os.Stderr, "%s: %#v\n", format, err)
-	}
-	os.Exit(1)
 }
