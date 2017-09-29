@@ -100,7 +100,7 @@ func Copy(dst *os.File, src io.Reader, buf []byte) (written int64, err error) {
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
-			nw := BufSize
+			nw := nr
 			var ew error
 			if !zero.Zero(buf[:nr]) {
 				nw, ew = dst.WriteAt(buf[:nr], off)
@@ -216,7 +216,7 @@ func realMain() error {
 		}
 	}
 
-	Debugf("extraction complete:", time.Since(t))
+	Debugf("extraction complete: %s", time.Since(t))
 	return nil
 }
 
